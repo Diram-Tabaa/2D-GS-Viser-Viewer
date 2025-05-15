@@ -25,7 +25,7 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr, overlay_images, gradient_map
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -40,7 +40,7 @@ class Trainer:
     def __init__(self):
         self.update_queue = queue.Queue()
         self.lock = threading.Lock()
-    
+        self.blend_iteration = 0
     def set_viewer(self, args, exp_path, src_path):
         self.viser_viewer = Viewer(args = args,
                                     model_paths = exp_path, 
@@ -51,9 +51,17 @@ class Trainer:
                                     show_cameras = True,
                                     )
     def viewer_thread(self):
-        self.viser_viewer.start()
+        self.viser_viewer.start(block = False)
+    
+    def blend_image(self, image1, image2, iteration, blend_start, blend_end):
+        if iteration < blend_start: 
+            return image1
+        else:
+            weight1 = min((iteration - blend_start) / (blend_end - blend_start), 1)
+            weight2 = 1 - weight1
+            return overlay_images(image1, image2, weight2, weight1)
 
-    def training(self, args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+    def training(self, args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, visbility_iterations, checkpoint):
         first_iter = 0
         tb_writer, exp_path = self.prepare_output_and_logger(dataset)
         gaussians = GaussianModel(dataset.sh_degree)
@@ -73,6 +81,7 @@ class Trainer:
         ema_loss_for_log = 0.0
         ema_dist_for_log = 0.0
         ema_normal_for_log = 0.0
+        ema_edge_for_log = 0.0 
 
         self.set_viewer(args, [exp_path], args.source_path)
         self.viser_viewer._get_training_gaussians(gaussians)
@@ -87,14 +96,18 @@ class Trainer:
         for iteration in range(first_iter, opt.iterations + 1):      
             iter_start.record()
             gaussians.update_learning_rate(iteration)
+            
             if iteration % 100 == 0:
                 with self.lock:
                     self.viser_viewer._get_training_gaussians(gaussians)
 
+            if iteration > opt.freeze_iteration:
+                gaussians.freeze_parameters(opt.freeze_params)
+
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % 1000 == 0:
                 gaussians.oneupSHdegree()
-
+               
             # Pick a random Camera
             if not viewpoint_stack:
                 viewpoint_stack = scene.getTrainCameras().copy()
@@ -104,15 +117,22 @@ class Trainer:
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             
             gt_image = viewpoint_cam.original_image.cuda()
-            gt_mask = viewpoint_cam.gt_mask.cuda()
+            gt_origin = gt_image
+            gt_image = self.blend_image(gt_image, viewpoint_cam.semantic_image.cuda(),
+                                        iteration, opt.blend_start_iteration, 
+                                        opt.blend_end_iteration)
+            
+            #gt_mask = viewpoint_cam.gt_mask.cuda()
 
             Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            ssim_loss = 1.0 - ssim(image, gt_image if opt.blend_ssim else gt_origin)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
 
             # regularization
             lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
             lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
-
+            lambda_edge = opt.lambda_edge if iteration > opt.blend_end_iteration else 0.0
+            
             rend_dist = render_pkg["rend_dist"]
             rend_normal  = render_pkg['rend_normal']
             surf_normal = render_pkg['surf_normal']
@@ -122,8 +142,13 @@ class Trainer:
             normal_loss = lambda_normal * (normal_error).mean()
             dist_loss = lambda_dist * (rend_dist).mean()
 
+            # edge loss 
+            edge = gradient_map(image)
+            gt_edge = gradient_map(gt_image)
+            edge_loss = lambda_edge * l1_loss(edge, gt_edge) # or l1
+            
             # loss
-            total_loss = loss + dist_loss + normal_loss
+            total_loss = loss + dist_loss + normal_loss + edge_loss
             total_loss.backward()
             iter_end.record()
 
@@ -132,12 +157,13 @@ class Trainer:
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
                 ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
-
+                ema_edge_for_log = 0.4 * edge_loss.item() + 0.6 * ema_edge_for_log
                 if iteration % 10 == 0:
                     loss_dict = {
                         "Loss": f"{ema_loss_for_log:.{5}f}",
                         "distort": f"{ema_dist_for_log:.{5}f}",
                         "normal": f"{ema_normal_for_log:.{5}f}",
+                        "edge": f"{ema_edge_for_log:.{5}f}",
                         "Points": f"{len(gaussians.get_xyz)}"
                     }
                     progress_bar.set_postfix(loss_dict)
@@ -158,11 +184,14 @@ class Trainer:
                     tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                     tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
 
-                self.training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+                self.training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations,  opt.blend_start_iteration, 
+                                        opt.blend_end_iteration, scene, render, (pipe, background))
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
-
+                if (iteration in visbility_iterations):
+                    print("\n[ITER {}] Saving Visbility".format(iteration))
+                    self.visibility_report(iteration, scene, render, (pipe, background))
                 # Densification
                 if iteration < opt.densify_until_iter:
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -207,7 +236,17 @@ class Trainer:
         return tb_writer, args.model_path
 
     @torch.no_grad()
-    def training_report(self, tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    def visibility_report(self, iteration, scene: Scene, renderFunc, renderArgs):
+        visibility_table = {}
+        for idx, viewpoint in enumerate(scene.getTrainCameras()):
+            render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+            radii = render_pkg['radii'].cpu()
+            viewspace_points = render_pkg['viewspace_points'].cpu()
+            visibility_table[viewpoint.image_name] = (radii, viewspace_points)
+        torch.save(visibility_table, scene.model_path + "/visibility" + str(iteration) + ".pth")
+
+    @torch.no_grad()
+    def training_report(self, tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, blend_start, blend_end, scene : Scene, renderFunc, renderArgs):
         if tb_writer:
             tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
             tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -218,16 +257,17 @@ class Trainer:
         if iteration in testing_iterations:
             torch.cuda.empty_cache()
             validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                                {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
+                                 {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
             for config in validation_configs:
                 if config['cameras'] and len(config['cameras']) > 0:
                     l1_test = 0.0
                     psnr_test = 0.0
+                    visibilities = {}
                     for idx, viewpoint in enumerate(config['cameras']):
                         render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                         image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        gt_image = self.blend_image(gt_image, viewpoint.semantic_image.cuda().clamp(0.0, 1.0), iteration, blend_start, blend_end)
                         if tb_writer and (idx < 5):
                             from utils.general_utils import colormap
                             depth = render_pkg["surf_depth"]
@@ -251,9 +291,10 @@ class Trainer:
                             except:
                                 pass
 
-                            if iteration == testing_iterations[0]:
-                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-
+                            #if iteration == testing_iterations[0]:
+                            # we want to have ground truth at each blending stage
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        visibilities[viewpoint.image_name] = render_pkg["visibility_filter"]
                         l1_test += l1_loss(image, gt_image).mean().double()
                         psnr_test += psnr(image, gt_image).mean().double()
 
@@ -263,7 +304,7 @@ class Trainer:
                     if tb_writer:
                         tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                         tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
+                    #torch.save(visibilities, 'visibilities_{}.pth'.format(config['name']))
             torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -275,10 +316,11 @@ if __name__ == "__main__":
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 20_000, 25_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000])
+    parser.add_argument("--visibility_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -297,7 +339,9 @@ if __name__ == "__main__":
                 args.test_iterations, 
                 args.save_iterations, 
                 args.checkpoint_iterations, 
+                args.visibility_iterations,
                 args.start_checkpoint)
 
     # All done
     print("\nTraining complete.")
+    exit(0)
